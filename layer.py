@@ -32,14 +32,14 @@ class CausalConv1d(nn.Module):
 class CustomMambaBlock(nn.Module):
     def __init__(self, dim:int, expand_dim:int, hidden_dim:int, dt_value:int, state_dim:int):
         super().__init__()
-        
+
         self.dim = dim
         self.hidden_dim = hidden_dim
         self.expand_dim = expand_dim
         self.dt_value = dt_value
         self.ssm_state_dim = state_dim
-        
-        self.norm_layer = nn.LayerNorm((self.dim, self.hidden_dim))
+
+        self.norm_layer = nn.LayerNorm(self.hidden_dim)  # Normalize only the last dimension (hidden_dim)
         self.in_proj = nn.Linear(self.hidden_dim, self.expand_dim)     # decoder (layer for x, y)
         self.out_proj = nn.Linear(self.expand_dim, self.hidden_dim)    # encoder (layer for concat with z)
 
@@ -48,7 +48,9 @@ class CustomMambaBlock(nn.Module):
         # self.fwd_conv_layer = nn.Conv1d(in_channels=self.expand_dim, out_channels=self.expand_dim, kernel_size=1)
         # self.bwd_conv_layer = nn.Conv1d(in_channels=self.expand_dim, out_channels=self.expand_dim, kernel_size=1)
         self.act_layer = nn.SiLU()
-        self.SSM = SSM(in_features=self.expand_dim, dt_rank=self.dt_value, dim_inner=self.expand_dim, d_state=self.ssm_state_dim)   # SSM (from https://github.com/kyegomez/VisionMamba)
+        # Separate SSM instances for forward and backward directions (following official Vim implementation)
+        self.forward_SSM = SSM(in_features=self.expand_dim, dt_rank=self.dt_value, dim_inner=self.expand_dim, d_state=self.ssm_state_dim)
+        self.backward_SSM = SSM(in_features=self.expand_dim, dt_rank=self.dt_value, dim_inner=self.expand_dim, d_state=self.ssm_state_dim)
         
     def forward(self, x:torch.Tensor)-> torch.Tensor:
         x1 = self.norm_layer(x)
@@ -60,9 +62,9 @@ class CustomMambaBlock(nn.Module):
         x1 = rearrange(self.act_layer(self.fwd_conv_layer(xy)), "b c sl -> b sl c")
         y = rearrange(self.act_layer(self.bwd_conv_layer(xy)), "b c sl -> b sl c")
 
-        ### SSM        
-        x_out = self.SSM(x1)
-        y_out = self.SSM(y)
+        ### SSM (using separate parameters for forward and backward directions)
+        x_out = self.forward_SSM(x1)
+        y_out = self.backward_SSM(y)
         
         ### matmul
         xy_out = (x_out*z_out) + (y_out*z_out)
@@ -76,7 +78,8 @@ class CustomMambaBlock(nn.Module):
 def selective_scan(x, delta, A, B, C, D):
     _, L, _ = x.shape
 
-    deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, ED, N)
+    # Add numerical stability by clamping the exponent to prevent overflow/underflow
+    deltaA = torch.exp(torch.clamp(delta.unsqueeze(-1) * A, min=-20, max=20))  # (B, L, ED, N)
     deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (B, L, ED, N)
 
     BX = deltaB * (x.unsqueeze(-1))  # (B, L, ED, N)
@@ -92,7 +95,8 @@ def selective_scan(x, delta, A, B, C, D):
 def selective_scan_seq(x, delta, A, B, C, D, dim_inner: int, d_state: int):
     _, L, _ = x.shape
 
-    deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, ED, N)
+    # Add numerical stability by clamping the exponent to prevent overflow/underflow
+    deltaA = torch.exp(torch.clamp(delta.unsqueeze(-1) * A, min=-20, max=20))  # (B, L, ED, N)
     deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (B, L, ED, N)
 
     BX = deltaB * (x.unsqueeze(-1))  # (B, L, ED, N)
@@ -142,7 +146,9 @@ class SSM(nn.Module):
         delta = F.softplus(self.dt_proj_layer(delta))
 
         # Assuming selective_scan and selective_scan_seq are defined functions
-        if pscan: y = selective_scan(x, delta, A, B, C, D)
-        else: y = selective_scan_seq(x, delta, A, B, C, D)
+        if pscan:
+            y = selective_scan(x, delta, A, B, C, D)
+        else:
+            y = selective_scan_seq(x, delta, A, B, C, D, self.dim_inner, self.d_state)
 
         return y
